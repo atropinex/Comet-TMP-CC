@@ -1,0 +1,48 @@
+{
+  "package_version": 2,
+  "version": "1.1.0",
+  "name": "tmp-text",
+  "description": "TextMesh-Pro style SDF text for Cocos Creator 3.8 (SDF font generator, shader, rich text label)",
+  "main": "./main.js",
+  "editor": ">=3.8.0",
+  "author": "you",
+  "contributions": {
+    "menu": [
+      {
+        "path": "i18n:menu.panel/TMP Text",
+        "label": "SDF Font Generator",
+        "message": "open-generator"
+      },
+      {
+        "path": "i18n:menu.panel/TMP Text",
+        "label": "Install / Update Runtime Scripts",
+        "message": "install-runtime"
+      }
+    ],
+    "messages": {
+      "open-generator": {
+        "methods": [
+          "openGenerator"
+        ]
+      },
+      "install-runtime": {
+        "methods": [
+          "installRuntime"
+        ]
+      }
+    }
+  },
+  "panels": {
+    "default": {
+      "title": "TMP SDF Font Generator",
+      "type": "dockable",
+      "main": "./panels/default/index.js",
+      "size": {
+        "min-width": 420,
+        "min-height": 520,
+        "width": 480,
+        "height": 640
+      }
+    }
+  }
+}

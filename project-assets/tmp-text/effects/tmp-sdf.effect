@@ -1,0 +1,109 @@
+// SDF text shader (TextMesh-Pro style): face, outline, underlay (shadow), glow.
+// Distance units: 1.0 in "params/underlay/glow" == the full atlas spread (padding).
+CCEffect %{
+  techniques:
+  - name: opaque
+    passes:
+    - vert: tmp-vs:vert
+      frag: tmp-fs:frag
+      depthStencilState:
+        depthTest: false
+        depthWrite: false
+      blendState:
+        targets:
+        - blend: true
+          blendSrc: src_alpha
+          blendDst: one_minus_src_alpha
+          blendDstAlpha: one_minus_src_alpha
+      rasterizerState:
+        cullMode: none
+      properties:
+        outlineColor:  { value: [0, 0, 0, 1],       editor: { type: color } }
+        underlayColor: { value: [0, 0, 0, 0.6],     editor: { type: color } }
+        glowColor:     { value: [1, 0.8, 0.2, 1],   editor: { type: color } }
+        # x: face dilate, y: softness, z: outline width, w: screen px range (set by TMPLabel)
+        params:        { value: [0, 0, 0, 8] }
+        # xy: uv offset, z: dilate, w: softness
+        underlay:      { value: [0, 0, 0, 0] }
+        # x: offset, y: inner, z: outer, w: power
+        glow:          { value: [0, 0, 0, 1] }
+}%
+
+CCProgram tmp-vs %{
+  precision highp float;
+  #include <builtin/uniforms/cc-global>
+
+  in vec3 a_position;
+  in vec2 a_texCoord;
+  in vec4 a_color;
+
+  out vec4 v_color;
+  out vec2 v_uv;
+
+  vec4 vert () {
+    v_uv = a_texCoord;
+    v_color = a_color;
+    // UI batcher already bakes the world transform into a_position.
+    return cc_matViewProj * vec4(a_position, 1.0);
+  }
+}%
+
+CCProgram tmp-fs %{
+  precision highp float;
+
+  in vec4 v_color;
+  in vec2 v_uv;
+
+  uniform TMPConstants {
+    vec4 outlineColor;
+    vec4 underlayColor;
+    vec4 glowColor;
+    vec4 params;
+    vec4 underlay;
+    vec4 glow;
+  };
+
+  #pragma builtin(local)
+  layout(set = 2, binding = 11) uniform sampler2D cc_spriteTexture;
+
+  // straight-alpha "over" operator
+  vec4 over (vec4 t, vec4 b) {
+    float a = t.a + b.a * (1.0 - t.a);
+    vec3 c = (t.rgb * t.a + b.rgb * b.a * (1.0 - t.a)) / max(a, 0.0001);
+    return vec4(c, a);
+  }
+
+  vec4 frag () {
+    // 1 screen pixel == 0.5 / pxRange in sd units -> half-pixel anti-aliasing
+    float pxRange = max(params.w, 0.5);
+    float aa = 0.25 / pxRange;
+    float w = aa + params.y * 0.5;
+
+    float sd = texture(cc_spriteTexture, v_uv).a;
+
+    // face
+    float edge = 0.5 - params.x * 0.5;
+    vec4 face = vec4(v_color.rgb, v_color.a * smoothstep(edge - w, edge + w, sd));
+
+    // outline (grows outwards from the face edge)
+    float oEdge = edge - params.z * 0.5;
+    float oA = smoothstep(oEdge - w, oEdge + w, sd) * step(0.0001, params.z);
+    vec4 outline = vec4(outlineColor.rgb, outlineColor.a * oA * v_color.a);
+
+    // underlay / drop shadow
+    float usd = texture(cc_spriteTexture, v_uv - underlay.xy).a;
+    float uEdge = oEdge - underlay.z * 0.5;
+    float uw = aa + underlay.w * 0.5;
+    float uA = smoothstep(uEdge - uw, uEdge + uw, usd) * step(0.0001, underlayColor.a);
+    vec4 under = vec4(underlayColor.rgb, underlayColor.a * uA * v_color.a);
+
+    // glow
+    float c = oEdge - glow.x * 0.5;
+    float outerR = max(glow.z * 0.5, 0.0001);
+    float t = clamp((sd - (c - outerR)) / (outerR + glow.y * 0.5), 0.0, 1.0);
+    float gA = pow(t, max(glow.w, 0.01)) * step(0.0001, glow.z);
+    vec4 gl = vec4(glowColor.rgb, glowColor.a * gA * v_color.a);
+
+    return over(face, over(outline, over(under, gl)));
+  }
+}%
