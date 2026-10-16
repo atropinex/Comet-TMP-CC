@@ -20,7 +20,11 @@ const G_GLOW = grp('glow', 'Glow', 7);
 export enum TMPOverflow { Overflow, Wrap, Shrink, ResizeHeight }
 export enum TMPHAlign { Left, Center, Right }
 export enum TMPVAlign { Top, Middle, Bottom }
-Enum(TMPOverflow); Enum(TMPHAlign); Enum(TMPVAlign);
+export enum TMPGradientType { Linear, Reflected, Radial, Diamond, Angular }
+export enum TMPGradientScope { Text, Line, Sentence, Word, Character }
+Enum(TMPOverflow); Enum(TMPHAlign); Enum(TMPVAlign); Enum(TMPGradientType); Enum(TMPGradientScope);
+
+const SENT_END = '.!?\u3002\uff01\uff1f\u2026';
 
 /* ------------------------------------------------------------------ */
 /* Font data (produced by the SDF Font Generator panel)                */
@@ -59,6 +63,14 @@ interface Item {
 }
 interface Line { items: Item[]; w: number; asc: number; desc: number; h: number; }
 interface LinkRect { id: string; x0: number; x1: number; y0: number; y1: number; }
+
+interface Rec {
+    x0: number; y0: number; x1: number; y1: number;
+    u0: number; v0: number; u1: number; v1: number;
+    c0: RGBA; c1: RGBA;          // top / bottom colour
+    shear: number; sb: number;   // italic shear and its baseline
+    g: number;                   // gradient group id
+}
 
 /** Collects quads (4 verts each: BL, BR, TL, TR) */
 class Layer {
@@ -123,7 +135,8 @@ const TMPAssembler: any = {
 };
 
 const LAYOUT_KEYS = ['text', 'fontSize', 'richText', 'overflow', 'hAlign', 'vAlign',
-    'lineSpacing', 'letterSpacing', 'minFontSize', 'fontData', 'atlas'];
+    'lineSpacing', 'letterSpacing', 'minFontSize', 'fontData', 'atlas',
+    'gradientType', 'gradientScope', 'gradientDetail'];
 
 /* ------------------------------------------------------------------ */
 /* Component                                                           */
@@ -158,12 +171,17 @@ export class TMPLabel extends UIRenderer {
     faceDilate = 0;
     @property({ group: G_FACE, slide: true, range: [0, 1, 0.01] }) softness = 0;
 
-    /* ---- gradient (across the whole text, multiplies the face colour) ---- */
+    /* ---- gradient (multiplies the face colour) ---- */
     @property({ group: G_GRAD }) gradientEnabled = false;
-    @property({ type: Color, group: G_GRAD }) gradientColorA = new Color(255, 255, 255, 255);
-    @property({ type: Color, group: G_GRAD }) gradientColorB = new Color(255, 120, 0, 255);
-    @property({ group: G_GRAD, slide: true, range: [0, 360, 1], tooltip: '0 = A at top -> B at bottom, 90 = A left -> B right' })
+    @property({ type: TMPGradientType, group: G_GRAD }) gradientType: TMPGradientType = TMPGradientType.Linear;
+    @property({ type: TMPGradientScope, group: G_GRAD, tooltip: 'What one gradient spans: the whole text, each line, sentence, word or character' })
+    gradientScope: TMPGradientScope = TMPGradientScope.Text;
+    @property({ type: Color, group: G_GRAD, tooltip: 'Start colour (top / centre)' }) gradientColorA = new Color(255, 255, 255, 255);
+    @property({ type: Color, group: G_GRAD, tooltip: 'End colour (bottom / edge)' }) gradientColorB = new Color(255, 120, 0, 255);
+    @property({ group: G_GRAD, slide: true, range: [0, 360, 1], tooltip: 'Linear/Reflected: 0 = top->bottom, 90 = left->right. Angular: start angle clockwise from top. Ignored by Radial/Diamond.' })
     gradientAngle = 0;
+    @property({ group: G_GRAD, slide: true, range: [1, 8, 1], tooltip: 'Subdivisions per glyph for non-linear types. Higher = smoother, more vertices.' })
+    gradientDetail = 4;
 
     /* ---- outline ---- */
     @property({ type: Color, group: G_OUT }) outlineColor = new Color(0, 0, 0, 255);
@@ -412,18 +430,24 @@ export class TMPLabel extends UIRenderer {
         const free = H - L.height;
         top -= this.vAlign === TMPVAlign.Middle ? free / 2 : this.vAlign === TMPVAlign.Bottom ? free : 0;
 
-        const mark = new Layer(), glyph = new Layer(), deco = new Layer();
+        const mark = new Layer();
+        const recs: Rec[] = [];
+        const bounds = new Map<number, number[]>();
+        const useGrad = this.gradientEnabled;
+        const scope = useGrad ? this.gradientScope : TMPGradientScope.Text;
         const sU = (f.solid.x + f.solid.s / 2) / f.atlasW, sV = (f.solid.y + f.solid.s / 2) / f.atlasH;
         const alignStr = ['left', 'center', 'right'][this.hAlign];
+        let wordId = 0, sentId = 0, charId = 0, lineIdx = 0, inWord = false;
 
         for (const ln of L.lines) {
             const baseline = top - (ln.asc + (ln.h - ln.asc - ln.desc) * 0.5);
             const first = ln.items.find((i) => !i.nl);
             const al = first?.st.align ?? alignStr;
             let x = left + (al === 'center' ? (W - ln.w) / 2 : al === 'right' ? W - ln.w : 0);
+            const yb0 = baseline - ln.desc, yb1 = baseline + ln.asc;
 
             for (const it of ln.items) {
-                if (it.nl) continue;
+                if (it.nl) { inWord = false; sentId++; continue; }
                 const st = it.st;
                 const x0 = x;
                 const sz = st.size * k;
@@ -431,9 +455,26 @@ export class TMPLabel extends UIRenderer {
                 const c0 = this._tint(st.gradient ? st.gradient[0] : st.color);
                 const c1 = this._tint(st.gradient ? st.gradient[1] : st.color);
 
+                // gradient group + bounds (line box height so every glyph on a line shares one ramp)
+                if (it.space) inWord = false;
+                else if (!inWord || it.cjk) { wordId++; inWord = !it.cjk; }
+                const gid = scope === TMPGradientScope.Line ? lineIdx
+                    : scope === TMPGradientScope.Word ? wordId
+                    : scope === TMPGradientScope.Sentence ? sentId
+                    : scope === TMPGradientScope.Character ? charId : 0;
+                charId++;
+                if (!it.space) {
+                    const bb = bounds.get(gid);
+                    if (!bb) bounds.set(gid, [x0, yb0, x0 + it.adv, yb1]);
+                    else {
+                        bb[0] = Math.min(bb[0], x0); bb[1] = Math.min(bb[1], yb0);
+                        bb[2] = Math.max(bb[2], x0 + it.adv); bb[3] = Math.max(bb[3], yb1);
+                    }
+                }
+
                 if (st.mark) {
                     const mc = this._tint(st.mark);
-                    mark.quad(x0, baseline - ln.desc, x0 + it.adv, baseline + ln.asc, sU, sV, sU, sV, mc, mc);
+                    mark.quad(x0, yb0, x0 + it.adv, yb1, sU, sV, sU, sV, mc, mc);
                 }
 
                 const g = it.g;
@@ -444,39 +485,107 @@ export class TMPLabel extends UIRenderer {
                     const u1 = (g.x + g.w) / f.atlasW, v1 = (g.y + g.h) / f.atlasH;
                     const gw = g.w * it.s, gh = g.h * it.s;
                     const shear = st.italic ? 0.2 : 0, sb = baseline + vo;
-                    if (st.bold) {
-                        const d = sz * 0.025;
-                        glyph.quad(gx - d, gy1 - gh, gx - d + gw, gy1, u0, v0, u1, v1, c0, c1, shear, sb);
-                        glyph.quad(gx + d, gy1 - gh, gx + d + gw, gy1, u0, v0, u1, v1, c0, c1, shear, sb);
-                    } else {
-                        glyph.quad(gx, gy1 - gh, gx + gw, gy1, u0, v0, u1, v1, c0, c1, shear, sb);
-                    }
+                    const push = (dx: number) => recs.push({
+                        x0: gx + dx, y0: gy1 - gh, x1: gx + dx + gw, y1: gy1, u0, v0, u1, v1, c0, c1, shear, sb, g: gid,
+                    });
+                    if (st.bold) { const d = sz * 0.025; push(-d); push(d); } else push(0);
                 }
 
                 const thick = Math.max(1, sz * 0.06);
-                if (st.underline) {
-                    const y1 = baseline - sz * 0.08;
-                    deco.quad(x0, y1 - thick, x0 + it.adv, y1, sU, sV, sU, sV, c0, c0);
-                }
-                if (st.strike) {
-                    const y1 = baseline + sz * 0.3 + thick / 2;
-                    deco.quad(x0, y1 - thick, x0 + it.adv, y1, sU, sV, sU, sV, c0, c0);
-                }
+                const line = (yTop: number) => recs.push({
+                    x0, y0: yTop - thick, x1: x0 + it.adv, y1: yTop, u0: sU, v0: sV, u1: sU, v1: sV,
+                    c0, c1: c0, shear: 0, sb: 0, g: gid,
+                });
+                if (st.underline) line(baseline - sz * 0.08);
+                if (st.strike) line(baseline + sz * 0.3 + thick / 2);
                 if (st.link !== null) {
-                    this._links.push({ id: st.link, x0, x1: x0 + it.adv, y0: baseline - ln.desc, y1: baseline + ln.asc });
+                    this._links.push({ id: st.link, x0, x1: x0 + it.adv, y0: yb0, y1: yb1 });
                 }
+                if (SENT_END.indexOf(it.ch) >= 0) sentId++;
                 x = x0 + it.adv;
             }
             top -= ln.h;
+            lineIdx++;
         }
 
-        const n = mark.n + glyph.n + deco.n;
-        if (n === 0) return;
-        const P = mark.p.concat(glyph.p, deco.p);
-        const T = mark.t.concat(glyph.t, deco.t);
-        const C = mark.c.concat(glyph.c, deco.c);
+        // ---- gradient + (optional) subdivision ----
+        const gType = this.gradientType;
+        const A = this.gradientColorA, B = this.gradientColorB;
+        const gA = [A.r / 255, A.g / 255, A.b / 255, A.a / 255];
+        const gB = [B.r / 255, B.g / 255, B.b / 255, B.a / 255];
+        const ang = this.gradientAngle * Math.PI / 180;
+        const ldx = Math.sin(ang), ldy = -Math.cos(ang); // 0deg = top -> bottom
 
-        if (this.gradientEnabled) this._applyGradient(P, C, glyph.n ? glyph.p : P, mark.n * 4, n * 4);
+        let sub = 1;
+        if (useGrad && gType !== TMPGradientType.Linear) {
+            sub = Math.max(gType === TMPGradientType.Reflected ? 2 : 1, Math.round(this.gradientDetail));
+        }
+        sub = Math.max(1, Math.min(sub, Math.floor(Math.sqrt(12000 / Math.max(1, recs.length)))));
+
+        const gradT = (bb: number[], x: number, y: number): number => {
+            const w = Math.max(bb[2] - bb[0], 1e-3), h = Math.max(bb[3] - bb[1], 1e-3);
+            const cx = (bb[0] + bb[2]) / 2, cy = (bb[1] + bb[3]) / 2;
+            let t: number;
+            switch (gType) {
+                case TMPGradientType.Radial: {
+                    const nx = (x - cx) / (w / 2), ny = (y - cy) / (h / 2);
+                    t = Math.sqrt(nx * nx + ny * ny); break;
+                }
+                case TMPGradientType.Diamond:
+                    t = Math.abs((x - cx) / (w / 2)) + Math.abs((y - cy) / (h / 2)); break;
+                case TMPGradientType.Angular: {
+                    t = Math.atan2(x - cx, y - cy) / (2 * Math.PI) + this.gradientAngle / 360;
+                    t = ((t % 1) + 1) % 1; break;
+                }
+                default: {
+                    t = ((x - cx) * ldx + (y - cy) * ldy) / (Math.abs(ldx) * w + Math.abs(ldy) * h) + 0.5;
+                    t = t < 0 ? 0 : t > 1 ? 1 : t;
+                    if (gType === TMPGradientType.Reflected) t = 1 - Math.abs(2 * t - 1);
+                }
+            }
+            return t < 0 ? 0 : t > 1 ? 1 : t;
+        };
+
+        const body = new Layer();
+        for (const r of recs) {
+            const bb = useGrad ? (bounds.get(r.g) ?? [r.x0, r.y0, r.x1, r.y1]) : null;
+            const st = sub + 1;
+            const vx: number[] = [], vy: number[] = [], vu: number[] = [], vv: number[] = [], vc: number[] = [];
+            for (let j = 0; j <= sub; j++) {
+                const fy = j / sub;
+                const y = r.y0 + (r.y1 - r.y0) * fy;
+                const sh = (y - r.sb) * r.shear;
+                const xl = r.x0 + sh, xr = r.x1 + sh;
+                const v = r.v1 + (r.v0 - r.v1) * fy;
+                for (let i = 0; i <= sub; i++) {
+                    const fx = i / sub;
+                    const x = xl + (xr - xl) * fx;
+                    vx.push(x); vy.push(y); vu.push(r.u0 + (r.u1 - r.u0) * fx); vv.push(v);
+                    const t = bb ? gradT(bb, x, y) : 0;
+                    for (let c = 0; c < 4; c++) {
+                        let col = r.c1[c] + (r.c0[c] - r.c1[c]) * fy;
+                        if (bb) col *= gA[c] + (gB[c] - gA[c]) * t;
+                        vc.push(col);
+                    }
+                }
+            }
+            for (let j = 0; j < sub; j++) {
+                for (let i = 0; i < sub; i++) {
+                    const k0 = j * st + i;
+                    for (const kk of [k0, k0 + 1, k0 + st, k0 + st + 1]) { // BL, BR, TL, TR
+                        body.p.push(vx[kk], vy[kk]);
+                        body.t.push(vu[kk], vv[kk]);
+                        body.c.push(vc[kk * 4], vc[kk * 4 + 1], vc[kk * 4 + 2], vc[kk * 4 + 3]);
+                    }
+                }
+            }
+        }
+
+        const n = mark.n + body.n;
+        if (n === 0) return;
+        const P = mark.p.concat(body.p);
+        const T = mark.t.concat(body.t);
+        const C = mark.c.concat(body.c);
 
         rd.dataLength = n * 4;
         rd.resize(n * 4, n * 6);
@@ -491,28 +600,6 @@ export class TMPLabel extends UIRenderer {
         this._quads = n;
         rd.vertDirty = true;
         this._lastMat = null; // re-apply material params after (re)build
-    }
-
-    /** Linear gradient over the text bounds; multiplies existing vertex colours. Skips highlight (mark) quads. */
-    private _applyGradient(P: number[], C: number[], boundsSrc: number[], from: number, to: number) {
-        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-        for (let i = 0; i < boundsSrc.length; i += 2) {
-            x0 = Math.min(x0, boundsSrc[i]); x1 = Math.max(x1, boundsSrc[i]);
-            y0 = Math.min(y0, boundsSrc[i + 1]); y1 = Math.max(y1, boundsSrc[i + 1]);
-        }
-        const w = Math.max(x1 - x0, 1e-3), h = Math.max(y1 - y0, 1e-3);
-        const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-        const ang = this.gradientAngle * Math.PI / 180;
-        const dx = Math.sin(ang), dy = -Math.cos(ang);               // 0deg = top -> bottom
-        const denom = Math.abs(dx) * w + Math.abs(dy) * h;
-        const A = this.gradientColorA, B = this.gradientColorB;
-        const a = [A.r / 255, A.g / 255, A.b / 255, A.a / 255];
-        const b = [B.r / 255, B.g / 255, B.b / 255, B.a / 255];
-        for (let i = from; i < to; i++) {
-            let t = ((P[i * 2] - cx) * dx + (P[i * 2 + 1] - cy) * dy) / denom + 0.5;
-            t = t < 0 ? 0 : t > 1 ? 1 : t;
-            for (let c = 0; c < 4; c++) C[i * 4 + c] *= a[c] + (b[c] - a[c]) * t;
-        }
     }
 
     /* ---------------- material parameters ---------------- */
